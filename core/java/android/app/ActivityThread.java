@@ -102,6 +102,8 @@ import android.view.WindowManager;
 import android.view.WindowManagerGlobal;
 import android.renderscript.RenderScriptCacheDir;
 import android.security.keystore.AndroidKeyStoreProvider;
+import android.system.Os;
+import android.os.Environment;
 
 import com.android.internal.app.IVoiceInteractor;
 import com.android.internal.content.ReferrerIntent;
@@ -126,11 +128,19 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.TimeZone;
 
 import libcore.io.DropBox;
 import libcore.io.EventLogger;
 import libcore.io.IoUtils;
+import java.io.FileReader;
+import java.io.BufferedReader;
+import java.lang.Boolean;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.FileNotFoundException;
 import libcore.net.event.NetworkEventDispatcher;
 import dalvik.system.CloseGuard;
 import dalvik.system.VMDebug;
@@ -168,6 +178,7 @@ public final class ActivityThread {
     private static final int SQLITE_MEM_RELEASED_EVENT_LOG_TAG = 75003;
     private static final int LOG_AM_ON_PAUSE_CALLED = 30021;
     private static final int LOG_AM_ON_RESUME_CALLED = 30022;
+    private static final String INCONGNITO_SETTING_FILE = "/sdcard/incog.config";
 
     /** Type for IActivityManager.serviceDoneExecuting: anonymous operation */
     public static final int SERVICE_DONE_EXECUTING_ANON = 0;
@@ -189,6 +200,7 @@ public final class ActivityThread {
     ActivityClientRecord mNewActivities = null;
     // Number of activities that are currently visible on-screen.
     int mNumVisibleActivities = 0;
+	boolean appIncognitoState = false;
     WeakReference<AssistStructure> mLastAssistStructure;
     final ArrayMap<IBinder, Service> mServices = new ArrayMap<>();
     AppBindData mBoundApplication;
@@ -215,6 +227,8 @@ public final class ActivityThread {
     boolean mSystemThread = false;
     boolean mJitEnabled = false;
     boolean mSomeActivitiesChanged = false;
+
+    private String appPackageName;
 
     // These can be accessed by multiple threads; mPackages is the lock.
     // XXX For now we keep around information about all packages we have
@@ -1360,6 +1374,9 @@ public final class ActivityThread {
 
                     r.packageInfo = getPackageInfoNoCheck(
                             r.activityInfo.applicationInfo, r.compatInfo);
+					Application incognitoApp = r.packageInfo.makeApplication(false, mInstrumentation);
+					String incogPackageName = incognitoApp.getPackageName();
+
                     handleLaunchActivity(r, null);
                     Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
                 } break;
@@ -2488,6 +2505,19 @@ public final class ActivityThread {
     }
 
     private void handleLaunchActivity(ActivityClientRecord r, Intent customIntent) {
+	if (mNumVisibleActivities == 0) {
+	    appIncognitoState = readIncognitoState(appPackageName);
+	    if (appIncognitoState) {
+		// Initialize the incognito mode
+		Slog.e(TAG, "Tiramisu: Incognito init");
+		if (Os.initIncognito(true)) {
+		    Slog.e(TAG, "Tiramisu Incognito init successful");
+		} else {
+		    Slog.e(TAG, "Tiramisu Incognito init failed");
+		}
+	    }
+	}
+
         // If we are getting ready to gc after going to the background, well
         // we are back active so skip it.
         unscheduleGcIdler();
@@ -3870,6 +3900,7 @@ public final class ActivityThread {
         }
         mActivities.remove(token);
         StrictMode.decrementExpectedActivityCount(activityClass);
+
         return r;
     }
 
@@ -3936,6 +3967,14 @@ public final class ActivityThread {
             }
         }
         mSomeActivitiesChanged = true;
+
+        // Stop incognito mode if this main activity was destroyed
+        Slog.e(TAG, "Tiramisu: mNumVisibleActivities =" + mNumVisibleActivities +
+					" App incognito state: " + appIncognitoState);
+        if (appIncognitoState && (mNumVisibleActivities == 0)) {
+            Os.stopIncognito();
+            Slog.e(TAG, "Tiramisu Incognito stop");
+        }
     }
 
     public final void requestRelaunchActivity(IBinder token,
@@ -4470,6 +4509,60 @@ public final class ActivityThread {
         }
     }
 
+	public boolean isExternalStorageAvailable(boolean needWriteAccess) {
+    	String state = Environment.getExternalStorageState();
+    	Log.e("Tiramisu", "storage state is " + state);
+
+    	if (Environment.MEDIA_MOUNTED.equals(state)) {
+    	    return true;
+    	} else if (!needWriteAccess &&
+            Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
+       		return true;
+   		}
+    	return false;
+	}
+	boolean getAppIncognitoState(String packageName, File f) {
+		FileInputStream fios;
+		try (FileReader fileReader = new FileReader(f)) {
+            Properties config = new Properties();
+            config.load(fileReader);
+            String value = config.getProperty(packageName);
+            if (value != null) {
+                switch(value) {
+                    case "true":
+                        return true;
+                    case "false":
+                    default:
+                        return false;
+                }
+            }
+		} catch (FileNotFoundException e) {
+			Log.d("Tiramisu", "App does not have permission to read external storage");
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+
+		return false;
+	}
+
+	public boolean readIncognitoState(String incogPackageName)  {
+		if(isExternalStorageAvailable(true /* needWriteAccess */)) {
+			try {
+				File f = new File(INCONGNITO_SETTING_FILE);
+				if (!f.exists()) {
+					Log.d("Tiramisu", INCONGNITO_SETTING_FILE + " file does not exist");
+				} else {
+					boolean incognitoMode = getAppIncognitoState(incogPackageName, f);
+					Log.d("Tiramisu", incogPackageName + " is started in " + incognitoMode);
+					return incognitoMode;
+				}
+			} catch (Exception e) {
+				Log.e("Tiramisu", "cannot get package info for " + e.toString());
+			}
+		}
+		return false;
+	}
+
     private void handleBindApplication(AppBindData data) {
         mBoundApplication = data;
         mConfiguration = new Configuration(data.config);
@@ -4532,8 +4625,8 @@ public final class ActivityThread {
         mResourcesManager.applyConfigurationToResourcesLocked(data.config, data.compatInfo);
         mCurDefaultDisplayDpi = data.config.densityDpi;
         applyCompatConfiguration(mCurDefaultDisplayDpi);
-
         data.info = getPackageInfoNoCheck(data.appInfo, data.compatInfo);
+	appPackageName = data.info.getPackageName();
 
         /**
          * Switch this process to density compatibility mode if needed.
